@@ -1,0 +1,2 @@
+iter,sample,CostTheory,costPower,costError,costQoS,P,R,Pcoef,Rcoef,weight1,weight2,weight3,weight4,weight5,weight6,weight7,weight8,prob1,prob2,prob3,prob4,prob5,prob6,prob7,prob8
+0,0,335.378987,89.593200,116.175884,129.609903,300037,1393,1.699997,0.029982,0.125,0.125,0.125,0.125,0.125,0.125,0.125,0.125,1.0,0,0,0,0,0,1.0,1.0
