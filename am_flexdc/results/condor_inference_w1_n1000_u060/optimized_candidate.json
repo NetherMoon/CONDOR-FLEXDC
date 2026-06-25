@@ -1,0 +1,52 @@
+{
+  "workload": "W1-train",
+  "server_count": 1000,
+  "utilization": 0.6,
+  "starting_weight_sample_id": 0,
+  "starting_pbar_kw_per_server": 0.5034888888888889,
+  "starting_r_kw_per_server": 0.233395061728395,
+  "starting_weights": [
+    0.25,
+    0.25,
+    0.25,
+    0.25
+  ],
+  "optimized_pbar_kw_per_server": 0.41643431782722473,
+  "optimized_r_kw_per_server": 0.2048194855451584,
+  "optimized_weights": [
+    0.6909558773040771,
+    0.07789193838834763,
+    0.0609363429248333,
+    0.17021599411964417
+  ],
+  "predicted_scaled_cost_power": 8.580634117126465,
+  "predicted_scaled_cost_error": 0.48178520798683167,
+  "predicted_scaled_cost_qos": -0.45147302746772766,
+  "predicted_optimization_objective": -0.13666468858718872,
+  "cost_weights": [
+    0.05,
+    0.7,
+    2.0
+  ],
+  "iterations": 150,
+  "learning_rate": 0.01,
+  "pbar_bounds_kw_per_server": [
+    0.1791,
+    0.763
+  ],
+  "pr_upper_bound_kw_per_server": 0.9156,
+  "r_lower_bound_kw_per_server": 0.01,
+  "weight_bounds_from_training_data": [
+    0.025,
+    0.925
+  ],
+  "workload_norm_weights": [
+    200.375,
+    717.0,
+    500.125,
+    2019.0,
+    3.3499999046325684,
+    1.0,
+    1.0
+  ]
+}
