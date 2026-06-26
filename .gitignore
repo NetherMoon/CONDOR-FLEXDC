@@ -1,0 +1,7 @@
+# Ignore W&B run directories anywhere in the repository
+**/wandb/
+**/wandb/**
+
+# Ignore results output directories anywhere in the repository
+**/results/
+**/results/**
