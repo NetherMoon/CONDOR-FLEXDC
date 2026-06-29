@@ -191,8 +191,15 @@ def make_validation_table(
         if actual_names != names:
             raise ValueError(f"Target-name mismatch: predicted={names}, actual={actual_names}")
         predicted = pred.loc[pred_label]
+        # Keep only actual workload-weight columns from grid_search_results.csv.
+        # The merged diagnostics row also contains audit metadata such as
+        # Weight_Equal_Value and Weight_Final_Lower_Bound; those are not
+        # workload weights and should not be parsed as Weight_i.
         weight_cols = sorted(
-            [col for col in source.index if str(col).startswith("Weight_") and str(col) != "Weight_Sample_ID"],
+            [
+                col for col in source.index
+                if str(col).startswith("Weight_") and str(col).split("_")[-1].isdigit()
+            ],
             key=lambda name: int(str(name).split("_")[-1]),
         )
         row = {
