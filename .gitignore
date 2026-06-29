@@ -5,3 +5,7 @@
 # Ignore results output directories anywhere in the repository
 **/results/
 **/results/**
+
+# Large local pilot CSV outputs
+am_flexdc/data/pilots/traditional_iso16_newqos_AQA_combined_grid_search_diagnostics.csv
+am_flexdc/data/pilots/traditional_iso16_newqos_AQA_combined_grid_search_results.csv
