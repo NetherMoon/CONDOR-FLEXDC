@@ -1,4 +1,4 @@
-"""Run unified surrogate optimization and optional FlexDC validation (raw-report v4).
+"""Run unified surrogate optimization and optional FlexDC validation (raw-report v6).
 
 This is the end-to-end wrapper for the four model variants trained by
 am_unified_training_utilities.py. It keeps the same role as the previous
@@ -22,7 +22,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from am_unified_optimize_one_v5 import optimize_inputs, resolve_raw_objective_mode
+from am_unified_optimize_one_v6 import optimize_inputs, resolve_raw_objective_mode
 from am_unified_predict_one import (
     default_objective_weights,
     parse_bool_text,
@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
                         help="Optional explicit upper bound for Pbar in kW/server. Leave unset for broad workload-derived bounds.")
     parser.add_argument("--r-max-kw-per-server", type=float, default=None,
                         help="Optional explicit upper bound for R in kW/server. Leave unset for broad workload-derived bounds.")
+    parser.add_argument("--selection-mode", choices=["objective", "raw_constraints"], default="objective",
+                        help="objective selects minimum predicted objective; raw_constraints first filters flexdc/raw trajectory rows by predicted raw tracking/QoS.")
+    parser.add_argument("--raw-tracking-threshold", type=float, default=0.3, help="Predicted epsilon_90 threshold for raw_constraints selection.")
+    parser.add_argument("--raw-qos-threshold", type=float, default=0.1, help="Predicted raw QoS mean threshold for raw_constraints selection.")
+    parser.add_argument("--raw-selection-primary", choices=["m_rsr", "objective"], default="m_rsr",
+                        help="Within predicted-feasible rows, select lowest predicted M_RSR or objective.")
 
     # FlexDC execution arguments.
     parser.add_argument("--flexdc-root", required=True, help="Path to FlexDC repository root.")
@@ -440,6 +446,10 @@ def make_validation_table(
             "Actual_Optimization_Objective_Type": resolved_raw_objective_mode if (target_family == "flexdc" and target_mode == "raw") else "weighted_sum",
             "Predicted_Target_Sum": float(predicted["Predicted_Target_Sum"]),
             "Actual_Target_Sum": float(np.sum(actual)),
+            "Raw_Objective_Mode": predicted.get("Raw_Objective_Mode", ""),
+            "Predicted_RawTracking_Pass": bool(predicted.get("Predicted_RawTracking_Pass", False)),
+            "Predicted_RawQoS_Pass": bool(predicted.get("Predicted_RawQoS_Pass", False)),
+            "Predicted_RawConstraints_Pass": bool(predicted.get("Predicted_RawConstraints_Pass", False)),
             "QoS_Delay_Probabilities": json.dumps([float(x) for x in qos_probs]) if len(qos_probs) else "",
             "Max_QoS_Delay_Probability": float(np.max(qos_probs)) if len(qos_probs) else np.nan,
             "Mean_QoS_Delay_Probability": float(np.mean(qos_probs)) if len(qos_probs) else np.nan,
@@ -525,12 +535,12 @@ def main() -> None:
         use_norm_pr=bool(use_norm_pr),
         objective_weights=objective_weights,
         raw_objective_mode=args.raw_objective_mode,
-        paper_ctrack_psi=args.paper_ctrack_psi,
-        paper_ctrack_mu=args.paper_ctrack_mu,
-        paper_ctrack_gamma=args.paper_ctrack_gamma,
-        paper_qos_beta=args.paper_qos_beta,
-        paper_qos_rho=args.paper_qos_rho,
-        paper_qos_threshold=args.paper_qos_threshold,
+        objective_ctrack_psi=args.objective_ctrack_psi,
+        objective_ctrack_mu=args.objective_ctrack_mu,
+        objective_ctrack_gamma=args.objective_ctrack_gamma,
+        objective_qos_beta=args.objective_qos_beta,
+        objective_qos_rho=args.objective_qos_rho,
+        objective_qos_threshold=args.objective_qos_threshold,
         iterations=args.iterations,
         lr=args.lr,
         device_name=args.device,
@@ -543,6 +553,10 @@ def main() -> None:
         pbar_min_kw_per_server=args.pbar_min_kw_per_server,
         pbar_max_kw_per_server=args.pbar_max_kw_per_server,
         r_max_kw_per_server=args.r_max_kw_per_server,
+        selection_mode=args.selection_mode,
+        raw_tracking_threshold=args.raw_tracking_threshold,
+        raw_qos_threshold=args.raw_qos_threshold,
+        raw_selection_primary=args.raw_selection_primary,
     )
     trajectory.to_csv(out_dir / "optimization_trajectory.csv", index=False)
     prediction_table.to_csv(out_dir / "optimization_comparison_before_validation.csv", index=False)
@@ -600,6 +614,7 @@ def main() -> None:
         "Predicted_raw_Ctrack_Epsilon_90th", "Actual_raw_Ctrack_Epsilon_90th",
         "Predicted_raw_qos_probability_mean", "Actual_raw_qos_probability_mean",
         "QoS_Violation_Ratio", "Max_QoS_Delay_Probability", "Mean_QoS_Delay_Probability", "Tracking_Pass", "QoS_Pass_CurrentLogic", "Both_Pass_CurrentLogic",
+        "Predicted_RawTracking_Pass", "Predicted_RawQoS_Pass", "Predicted_RawConstraints_Pass",
         "Predicted_Objective_M_RSR_Component", "Predicted_Objective_Ctrack_Component", "Predicted_Objective_CQoS_Component",
         "Predicted_PaperObjective_Approx", "paper_objective_from_raw",
         "FlexDC_Output_Dir",

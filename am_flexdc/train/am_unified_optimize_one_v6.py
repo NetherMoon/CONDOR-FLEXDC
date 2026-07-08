@@ -1,5 +1,7 @@
 """Optimize P, R, and workload weights with a frozen unified surrogate.
 
+v6 adds optional raw-constraint-aware selection after the gradient trajectory is generated.
+
 This follows the structure of CONDOR's original model_pr_descent(): keep the
 neural model fixed, compute the gradient of a weighted sum of predicted outputs,
 and update only P, R, and workload weights.
@@ -46,6 +48,10 @@ def calculate_pr_bounds(
     pbar_min_kw_per_server=None,
     pbar_max_kw_per_server=None,
     r_max_kw_per_server=None,
+    selection_mode="objective",
+    raw_tracking_threshold=0.3,
+    raw_qos_threshold=0.1,
+    raw_selection_primary="m_rsr",
 ):
     """Return physical P/R bounds in kW/server.
 
@@ -242,6 +248,10 @@ def optimize_inputs(
     pbar_min_kw_per_server=None,
     pbar_max_kw_per_server=None,
     r_max_kw_per_server=None,
+    selection_mode="objective",
+    raw_tracking_threshold=0.3,
+    raw_qos_threshold=0.1,
+    raw_selection_primary="m_rsr",
 ):
     target_family = target_family.lower().strip()
     target_mode = target_mode.lower().strip()
@@ -410,7 +420,67 @@ def optimize_inputs(
         weights.grad = None
 
     trajectory = pd.DataFrame(records)
-    best = trajectory.loc[trajectory["Predicted_Optimization_Objective"].idxmin()].to_dict()
+
+    selection_mode = str(selection_mode).lower().strip()
+    raw_selection_primary = str(raw_selection_primary).lower().strip()
+    selection_reason = "objective_min"
+    predicted_feasible_count = None
+    if selection_mode not in {"objective", "raw_constraints"}:
+        raise ValueError(f"Unknown selection_mode={selection_mode}; expected objective or raw_constraints")
+    if raw_selection_primary not in {"m_rsr", "objective"}:
+        raise ValueError(f"Unknown raw_selection_primary={raw_selection_primary}; expected m_rsr or objective")
+
+    if target_family == "flexdc" and target_mode == "raw":
+        eps_col = "Predicted_unscaled_raw_Ctrack_Epsilon_90th"
+        if eps_col not in trajectory.columns:
+            eps_col = "Predicted_raw_Ctrack_Epsilon_90th"
+        if "Predicted_unscaled_raw_qos_probability_mean" in trajectory.columns:
+            qos_col = "Predicted_unscaled_raw_qos_probability_mean"
+            qos_threshold_effective = float(raw_qos_threshold)
+        elif "Predicted_raw_qos_probability_mean" in trajectory.columns:
+            qos_col = "Predicted_raw_qos_probability_mean"
+            qos_threshold_effective = float(raw_qos_threshold)
+        elif "Predicted_unscaled_raw_qos_probability_sum" in trajectory.columns:
+            qos_col = "Predicted_unscaled_raw_qos_probability_sum"
+            qos_threshold_effective = float(raw_qos_threshold) * float(job_count)
+        elif "Predicted_raw_qos_probability_sum" in trajectory.columns:
+            qos_col = "Predicted_raw_qos_probability_sum"
+            qos_threshold_effective = float(raw_qos_threshold) * float(job_count)
+        else:
+            qos_col = None
+            qos_threshold_effective = None
+
+        if eps_col in trajectory.columns:
+            trajectory["Predicted_RawTracking_Pass"] = trajectory[eps_col].astype(float) <= float(raw_tracking_threshold)
+        else:
+            trajectory["Predicted_RawTracking_Pass"] = False
+        if qos_col is not None:
+            trajectory["Predicted_RawQoS_Pass"] = trajectory[qos_col].astype(float) <= float(qos_threshold_effective)
+        else:
+            trajectory["Predicted_RawQoS_Pass"] = False
+        trajectory["Predicted_RawConstraints_Pass"] = trajectory["Predicted_RawTracking_Pass"] & trajectory["Predicted_RawQoS_Pass"]
+    else:
+        trajectory["Predicted_RawTracking_Pass"] = False
+        trajectory["Predicted_RawQoS_Pass"] = False
+        trajectory["Predicted_RawConstraints_Pass"] = False
+
+    if selection_mode == "raw_constraints" and target_family == "flexdc" and target_mode == "raw":
+        feasible = trajectory[trajectory["Predicted_RawConstraints_Pass"]].copy()
+        predicted_feasible_count = int(len(feasible))
+        if len(feasible) > 0:
+            if raw_selection_primary == "m_rsr":
+                score_col = "Predicted_unscaled_flexdc_M_RSR" if "Predicted_unscaled_flexdc_M_RSR" in feasible.columns else "Predicted_flexdc_M_RSR"
+            else:
+                score_col = "Predicted_Optimization_Objective"
+            best = feasible.loc[feasible[score_col].astype(float).idxmin()].to_dict()
+            selection_reason = f"raw_constraints_feasible_min_{raw_selection_primary}"
+        else:
+            best = trajectory.loc[trajectory["Predicted_Optimization_Objective"].astype(float).idxmin()].to_dict()
+            selection_reason = "raw_constraints_no_predicted_feasible_fallback_objective_min"
+    else:
+        best = trajectory.loc[trajectory["Predicted_Optimization_Objective"].astype(float).idxmin()].to_dict()
+        selection_reason = "objective_min"
+
     candidate_weights = [float(best[f"Weight_{i}"]) for i in range(job_count)]
 
     start_row = trajectory.iloc[0].to_dict()
@@ -439,6 +509,12 @@ def optimize_inputs(
         "best_iteration": int(best["Iteration"]),
         "objective_weights": [float(x) for x in objective_weights],
         "raw_objective_mode": resolved_raw_objective_mode,
+        "selection_mode": selection_mode,
+        "selection_reason": selection_reason,
+        "predicted_feasible_count": predicted_feasible_count,
+        "raw_tracking_threshold": float(raw_tracking_threshold),
+        "raw_qos_threshold": float(raw_qos_threshold),
+        "raw_selection_primary": raw_selection_primary,
         "raw_objective_constants": {
             "ctrack_psi": float(objective_ctrack_psi),
             "ctrack_mu": float(objective_ctrack_mu),
@@ -503,6 +579,12 @@ def parse_args():
     parser.add_argument("--pbar-min-kw-per-server", type=float, default=None, help="Optional explicit lower bound for Pbar in kW/server.")
     parser.add_argument("--pbar-max-kw-per-server", type=float, default=None, help="Optional explicit upper bound for Pbar in kW/server.")
     parser.add_argument("--r-max-kw-per-server", type=float, default=None, help="Optional explicit upper bound for R in kW/server.")
+    parser.add_argument("--selection-mode", choices=["objective", "raw_constraints"], default="objective",
+                        help="objective selects the minimum predicted objective; raw_constraints first filters flexdc/raw trajectory rows by predicted raw tracking/QoS.")
+    parser.add_argument("--raw-tracking-threshold", type=float, default=0.3, help="Predicted epsilon_90 threshold used by --selection-mode raw_constraints.")
+    parser.add_argument("--raw-qos-threshold", type=float, default=0.1, help="Predicted raw QoS mean threshold used by --selection-mode raw_constraints.")
+    parser.add_argument("--raw-selection-primary", choices=["m_rsr", "objective"], default="m_rsr",
+                        help="Within predicted-feasible trajectory rows, select lowest predicted M_RSR or lowest predicted objective.")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--out-dir", default="unified_optimize_one_output")
     parser.add_argument("--wandb-project", default=None)
@@ -555,6 +637,10 @@ def main():
         pbar_min_kw_per_server=args.pbar_min_kw_per_server,
         pbar_max_kw_per_server=args.pbar_max_kw_per_server,
         r_max_kw_per_server=args.r_max_kw_per_server,
+        selection_mode=args.selection_mode,
+        raw_tracking_threshold=args.raw_tracking_threshold,
+        raw_qos_threshold=args.raw_qos_threshold,
+        raw_selection_primary=args.raw_selection_primary,
     )
     trajectory.to_csv(out_dir / "optimization_trajectory.csv", index=False)
     comparison.to_csv(out_dir / "optimization_comparison_before_validation.csv", index=False)
