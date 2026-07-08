@@ -1,4 +1,4 @@
-"""Run unified surrogate optimization and optional FlexDC validation.
+"""Run unified surrogate optimization and optional FlexDC validation (raw-report v4).
 
 This is the end-to-end wrapper for the four model variants trained by
 am_unified_training_utilities.py. It keeps the same role as the previous
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -62,9 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pbar-upper-factor", type=float, default=1.0)
     parser.add_argument("--pr-upper-factor", type=float, default=1.2)
     parser.add_argument("--r-lower-kw-per-server", type=float, default=0.01)
-    parser.add_argument("--pbar-min-kw-per-server", type=float, default=None, help="Optional explicit lower bound for Pbar in kW/server.")
-    parser.add_argument("--pbar-max-kw-per-server", type=float, default=None, help="Optional explicit upper bound for Pbar in kW/server.")
-    parser.add_argument("--r-max-kw-per-server", type=float, default=None, help="Optional explicit upper bound for R in kW/server.")
+    parser.add_argument("--pbar-min-kw-per-server", type=float, default=None,
+                        help="Optional explicit lower bound for Pbar in kW/server. Leave unset for broad workload-derived bounds.")
+    parser.add_argument("--pbar-max-kw-per-server", type=float, default=None,
+                        help="Optional explicit upper bound for Pbar in kW/server. Leave unset for broad workload-derived bounds.")
+    parser.add_argument("--r-max-kw-per-server", type=float, default=None,
+                        help="Optional explicit upper bound for R in kW/server. Leave unset for broad workload-derived bounds.")
 
     # FlexDC execution arguments.
     parser.add_argument("--flexdc-root", required=True, help="Path to FlexDC repository root.")
@@ -74,6 +78,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-name", default="AQA")
     parser.add_argument("--node-count-control", default="true")
     parser.add_argument("--run-flexdc", action="store_true", help="Actually run FlexDC validation. Omit for optimization-only dry run.")
+
+
+
+    # Optional report constants for paper-form objective reconstruction.
+    # For raw FlexDC models these are reporting-only; optimization still uses --objective-weights.
+    parser.add_argument("--report-ctrack-psi", type=float, default=1.0)
+    parser.add_argument("--report-ctrack-mu", type=float, default=10.0)
+    parser.add_argument("--report-ctrack-gamma", type=float, default=0.3)
+    parser.add_argument("--report-qos-beta", type=float, default=20.0)
+    parser.add_argument("--report-qos-rho", type=float, default=2.0)
+    parser.add_argument("--report-qos-threshold", type=float, default=0.1)
 
     # W&B is optional. If --wandb-project is omitted, no W&B logging occurs.
     parser.add_argument("--wandb-project", default=None)
@@ -106,7 +121,7 @@ def path_for_wizard(path_text: str) -> str:
     return path_text
 
 
-def run_wizard(args: argparse.Namespace, label: str, pbar: float, reserve: float, weights: list[float]) -> tuple[Path, Path]:
+def run_wizard(args: argparse.Namespace, label: str, pbar: float, reserve: float, weights: list[float]) -> tuple[Path, Path, Path]:
     flexdc_root = Path(args.flexdc_root).resolve()
     peacsim_dir = flexdc_root / "src" / "peacsim"
     output_label = f"{Path(args.out_dir).name}_{label}"
@@ -144,7 +159,7 @@ def run_wizard(args: argparse.Namespace, label: str, pbar: float, reserve: float
     if not folders:
         raise FileNotFoundError(f"Could not find FlexDC output folder for {output_label}")
     folder = folders[-1]
-    return folder / "grid_search_results.csv", folder / "grid_search_diagnostics.csv"
+    return folder / "grid_search_results.csv", folder / "grid_search_diagnostics.csv", folder
 
 
 
@@ -166,18 +181,22 @@ def stable_softplus(x):
 
 
 def parse_probability_vector(value) -> np.ndarray:
-    """Parse a QoS probability vector stored as a list-like CSV cell."""
+    """Parse a QoS probability vector stored as a list-like CSV cell.
+
+    Handles JSON lists, Python-list strings, and older strings like
+    [np.float64(0.1), ...].
+    """
     if isinstance(value, (list, tuple, np.ndarray)):
         return np.asarray(value, dtype=float)
     if pd.isna(value):
-        raise ValueError("QoS_Delay_Probabilities contains NaN; cannot recompute configured objective.")
+        raise ValueError("QoS_Delay_Probabilities contains NaN; cannot parse probability vector.")
     text = str(value).strip()
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
-        # Handles Python-list strings if any older CSV used single quotes.
+    except Exception:
         import ast
-        parsed = ast.literal_eval(text)
+        cleaned = re.sub(r"np\.float64\(([^()]*)\)", r"\1", text)
+        parsed = ast.literal_eval(cleaned)
     arr = np.asarray(parsed, dtype=float)
     if arr.ndim != 1:
         raise ValueError(f"Expected 1-D QoS probability vector, got shape {arr.shape}")
@@ -258,167 +277,99 @@ def pct_change(start: float, selected: float) -> float:
 
 
 
-def compute_condor_component_values(source: pd.Series, use_norm_cost: bool = True) -> dict:
-    """Compute CONDOR-style components from raw FlexDC validation outputs.
+def paper_form_objective_from_raw(
+    m_rsr: float,
+    epsilon_90: float,
+    qos_probs: np.ndarray,
+    *,
+    ctrack_psi: float,
+    ctrack_mu: float,
+    ctrack_gamma: float,
+    qos_beta: float,
+    qos_rho: float,
+    qos_threshold: float,
+) -> dict:
+    """Compute paper-form objective components from raw metrics."""
+    qos_probs = np.asarray(qos_probs, dtype=float)
+    ctrack = float(ctrack_psi * stable_softplus(ctrack_mu * (float(epsilon_90) - ctrack_gamma)))
+    cqos = float(qos_beta * np.sum(stable_softplus(qos_rho * (qos_probs - qos_threshold))))
+    return {
+        "paper_M_RSR": float(m_rsr),
+        "paper_Ctrack_from_raw": ctrack,
+        "paper_CQoS_from_raw": cqos,
+        "paper_objective_from_raw": float(m_rsr) + ctrack + cqos,
+    }
 
-    Raw definitions:
-      CPower_raw = 0.0003 * (P_actual_watts - R_actual_watts)
-      CError_raw = Mtrack_Error_MeanAbs_Watts / 1000
-      CQoS_raw   = 0.8 * sum SoftPlus(60 * (q_j - 0.1))
 
-    Released CONDOR scaling:
-      CPower_scaled = 120 * CPower_raw / server_count
-      CError_scaled = 200 * CError_raw / server_count
-      CQoS_scaled   = CQoS_raw / workload_mix_size
+def approx_paper_objective_from_raw_prediction(
+    pred_targets: dict,
+    names: list[str],
+    workload_size: int,
+    *,
+    ctrack_psi: float,
+    ctrack_mu: float,
+    ctrack_gamma: float,
+    qos_beta: float,
+    qos_rho: float,
+    qos_threshold: float,
+) -> dict:
+    """Approximate paper objective from raw-model predictions.
+
+    With current raw FlexDC model the QoS prediction is an aggregate
+    mean/sum, not a per-job-type vector. For target raw_qos_probability_mean,
+    this approximates every job type as having the predicted mean probability.
     """
-    from am_unified_training_utilities import (
-        CONDOR_POWER_COST_COEFFICIENT,
-        CONDOR_QOS_BETA,
-        CONDOR_QOS_RHO,
-        CONDOR_QOS_THRESHOLD,
+    out = {
+        "Predicted_PaperObjective_Approx": np.nan,
+        "Predicted_Ctrack_Approx": np.nan,
+        "Predicted_CQoS_Approx": np.nan,
+    }
+    if "flexdc_M_RSR" not in names or "raw_Ctrack_Epsilon_90th" not in names:
+        return out
+    m = float(pred_targets.get("flexdc_M_RSR", np.nan))
+    eps = float(pred_targets.get("raw_Ctrack_Epsilon_90th", np.nan))
+    qos_key_mean = "raw_qos_probability_mean"
+    qos_key_sum = "raw_qos_probability_sum"
+    if qos_key_mean in pred_targets:
+        q_mean = float(pred_targets[qos_key_mean])
+        q_probs = np.full(int(workload_size), q_mean, dtype=float)
+    elif qos_key_sum in pred_targets:
+        q_sum = float(pred_targets[qos_key_sum])
+        q_probs = np.full(int(workload_size), q_sum / float(workload_size), dtype=float)
+    else:
+        return out
+    pieces = paper_form_objective_from_raw(
+        m, eps, q_probs,
+        ctrack_psi=ctrack_psi, ctrack_mu=ctrack_mu, ctrack_gamma=ctrack_gamma,
+        qos_beta=qos_beta, qos_rho=qos_rho, qos_threshold=qos_threshold,
     )
-
-    server_count = float(source["server_count"])
-    workload_mix_size = float(source["workload_mix_size"])
-    p_actual_watts = float(source["P_actual_watts"])
-    r_actual_watts = float(source["R_actual_watts"])
-    mean_abs_watts = float(source["Mtrack_Error_MeanAbs_Watts"])
-
-    probs = parse_probability_vector(source["QoS_Delay_Probabilities"])
-    raw_power = CONDOR_POWER_COST_COEFFICIENT * (p_actual_watts - r_actual_watts)
-    raw_error = mean_abs_watts / 1000.0
-    raw_qos = CONDOR_QOS_BETA * float(np.sum(stable_softplus(CONDOR_QOS_RHO * (probs - CONDOR_QOS_THRESHOLD))))
-
-    scaled_power = raw_power * 120.0 / server_count
-    scaled_error = raw_error * 200.0 / server_count
-    scaled_qos = raw_qos / workload_mix_size
-
-    return {
-        "Condor_Raw_CPower": raw_power,
-        "Condor_Raw_CError_MeanAbsTracking_kW": raw_error,
-        "Condor_Raw_CQoS": raw_qos,
-        "Condor_Scaled_CPower": scaled_power,
-        "Condor_Scaled_CError": scaled_error,
-        "Condor_Scaled_CQoS": scaled_qos,
-        "Condor_Scaled_Target_Sum": scaled_power + scaled_error + scaled_qos,
-        "Condor_Raw_Target_Sum": raw_power + raw_error + raw_qos,
-    }
-
-
-def compute_flexdc_component_values(source: pd.Series) -> dict:
-    """Return configured-objective FlexDC components from the postprocessed source row."""
-    return {
-        "FlexDC_M_RSR": float(source["Simulator_RSR_Total_Cost"]),
-        "FlexDC_Simulator_Power_Cost": float(source["Simulator_Power_Cost"]) if "Simulator_Power_Cost" in source.index and not pd.isna(source["Simulator_Power_Cost"]) else np.nan,
-        "FlexDC_Mtrack_Cost": float(source["Mtrack_Cost"]) if "Mtrack_Cost" in source.index and not pd.isna(source["Mtrack_Cost"]) else np.nan,
-        "FlexDC_Ctrack_Epsilon_90th": float(source["Ctrack_Epsilon_90th"]),
-        "FlexDC_Ctrack_Weighted_Cost": float(source["Ctrack_Weighted_Cost"]),
-        "FlexDC_CQoS_Weighted_Cost": float(source["Diagnostic_FlexDC_SoftPlus_QoS_Cost"]),
-        "FlexDC_Full_Objective": float(source["Diagnostic_FullPaperObjective_Cost"]),
-    }
-
-
-def add_component_audit_columns(row: dict, source: pd.Series, actual: np.ndarray, predicted: pd.Series,
-                                names: list[str], objective_weights: np.ndarray,
-                                target_family: str, use_norm_cost: bool) -> dict:
-    """Append both formulation component values and active objective contributions."""
-    condor_values = compute_condor_component_values(source, use_norm_cost=use_norm_cost)
-    flexdc_values = compute_flexdc_component_values(source)
-    row.update(condor_values)
-    row.update(flexdc_values)
-
-    row["Objective_Weights"] = json.dumps([float(x) for x in objective_weights])
-    for idx, name in enumerate(names):
-        weight = float(objective_weights[idx])
-        actual_value = float(actual[idx])
-        predicted_value = float(predicted[f"Predicted_{name}"])
-        row[f"Active_Objective_Component_{idx}_Name"] = name
-        row[f"Active_Objective_Component_{idx}_Weight"] = weight
-        row[f"Active_Objective_Component_{idx}_Predicted"] = predicted_value
-        row[f"Active_Objective_Component_{idx}_Actual"] = actual_value
-        row[f"Active_Objective_Component_{idx}_Actual_Contribution"] = weight * actual_value
-        row[f"Active_Objective_Component_{idx}_Predicted_Contribution"] = weight * predicted_value
-    return row
-
-
-def build_component_comparison_table(summary: pd.DataFrame, target_family: str, target_mode: str) -> pd.DataFrame:
-    """Create a long-format table comparing start vs selected for all component definitions."""
-    if len(summary) < 2:
-        raise ValueError("Need at least start and selected rows to build component comparison table.")
-    start = summary.iloc[0]
-    selected = summary.iloc[1]
-
-    active_names = {
-        str(start.get(f"Active_Objective_Component_{i}_Name", "")): float(start.get(f"Active_Objective_Component_{i}_Weight", np.nan))
-        for i in range(3)
-    }
-
-    rows = []
-
-    def add_row(group, component, col, meaning="", active_name=None):
-        s = float(start[col]) if col in summary.columns and not pd.isna(start[col]) else np.nan
-        v = float(selected[col]) if col in summary.columns and not pd.isna(selected[col]) else np.nan
-        change = v - s if not (pd.isna(s) or pd.isna(v)) else np.nan
-        pct = pct_change(s, v) if not (pd.isna(s) or pd.isna(v)) else np.nan
-        weight = active_names.get(active_name, np.nan) if active_name else np.nan
-        rows.append({
-            "Group": group,
-            "Component": component,
-            "Starting": s,
-            "Selected": v,
-            "Change": change,
-            "Change_Percent": pct,
-            "Active_Objective_Weight": weight,
-            "Starting_Weighted_Contribution": weight * s if not pd.isna(weight) and not pd.isna(s) else np.nan,
-            "Selected_Weighted_Contribution": weight * v if not pd.isna(weight) and not pd.isna(v) else np.nan,
-            "Meaning": meaning,
-        })
-
-    add_row("Active optimized objective", "Predicted objective", "Predicted_Optimization_Objective", "Surrogate objective minimized during gradient descent")
-    add_row("Active optimized objective", "Actual objective", "Actual_Optimization_Objective", "Same target family/mode as optimizer, recomputed from simulator output")
-
-    add_row("CONDOR-style components", "CPower scaled", "Condor_Scaled_CPower", "Released CONDOR-scaled power component", "condor_cost_power")
-    add_row("CONDOR-style components", "CError scaled", "Condor_Scaled_CError", "Released CONDOR-scaled mean tracking-deviation component", "condor_cost_error")
-    add_row("CONDOR-style components", "CQoS scaled", "Condor_Scaled_CQoS", "Released CONDOR-scaled smoothed QoS component", "condor_cost_qos")
-    add_row("CONDOR-style components", "CONDOR scaled target sum", "Condor_Scaled_Target_Sum", "Unweighted sum of scaled CONDOR components")
-
-    add_row("CONDOR-style raw diagnostics", "CPower raw", "Condor_Raw_CPower", "0.0003 * (P_actual_watts - R_actual_watts)")
-    add_row("CONDOR-style raw diagnostics", "CError raw mean abs tracking kW", "Condor_Raw_CError_MeanAbsTracking_kW", "Mtrack_Error_MeanAbs_Watts / 1000")
-    add_row("CONDOR-style raw diagnostics", "CQoS raw", "Condor_Raw_CQoS", "0.8 * sum SoftPlus(60 * (q_j - 0.1))")
-
-    add_row("FlexDC-style components", "M_RSR", "FlexDC_M_RSR", "Reserve-service settlement cost", "flexdc_M_RSR")
-    add_row("FlexDC-style components", "Ctrack weighted", "FlexDC_Ctrack_Weighted_Cost", "Configured quantile tracking penalty", "flexdc_Ctrack_weighted")
-    add_row("FlexDC-style components", "CQoS weighted", "FlexDC_CQoS_Weighted_Cost", "Configured smoothed QoS penalty", "flexdc_CQoS_weighted")
-    add_row("FlexDC-style components", "Full objective", "FlexDC_Full_Objective", "M_RSR + Ctrack + CQoS")
-
-    add_row("Raw simulator diagnostics", "p90 tracking error", "Ctrack_Epsilon_90th", "Raw p90 normalized tracking error")
-    add_row("Raw simulator diagnostics", "Mean abs tracking error watts", "Mtrack_Error_MeanAbs_Watts", "Mean abs tracking error from power_trace.csv")
-    add_row("Raw simulator diagnostics", "QoS violation ratio", "QoS_Violation_Ratio", "Fraction of job types violating QoS")
-    add_row("Raw simulator diagnostics", "QoS delay probability sum", "QoS_Delay_Probability_Sum", "Sum of per-class delay probabilities")
-
-    return pd.DataFrame(rows)
-
-
+    out["Predicted_PaperObjective_Approx"] = pieces["paper_objective_from_raw"]
+    out["Predicted_Ctrack_Approx"] = pieces["paper_Ctrack_from_raw"]
+    out["Predicted_CQoS_Approx"] = pieces["paper_CQoS_from_raw"]
+    return out
 
 def make_validation_table(
     objective_weights: list[float],
     prediction_table: pd.DataFrame,
     start_results: Path,
     start_diagnostics: Path,
+    start_folder: Path,
     opt_results: Path,
     opt_diagnostics: Path,
+    opt_folder: Path,
     target_family: str,
     target_mode: str,
     use_norm_cost: bool,
     raw_qos_aggregation: str,
+    args: argparse.Namespace,
 ) -> pd.DataFrame:
     weights = np.asarray(objective_weights, dtype=float)
     pred = prediction_table.set_index("Configuration")
     names = target_names(target_family, target_mode, raw_qos_aggregation)
     rows = []
-    for label, result_path, diag_path, pred_label in [
-        ("Starting configuration", start_results, start_diagnostics, "Starting configuration"),
-        ("Selected configuration", opt_results, opt_diagnostics, "Selected configuration"),
+    for label, result_path, diag_path, folder_path, pred_label in [
+        ("Starting configuration", start_results, start_diagnostics, start_folder, "Starting configuration"),
+        ("Selected configuration", opt_results, opt_diagnostics, opt_folder, "Selected configuration"),
     ]:
         source, actual, actual_names = actual_targets_from_flexdc(
             result_path, diag_path, target_family, target_mode, use_norm_cost, raw_qos_aggregation
@@ -437,31 +388,55 @@ def make_validation_table(
             ],
             key=lambda name: int(str(name).split("_")[-1]),
         )
+        qos_probs = parse_probability_vector(source["QoS_Delay_Probabilities"]) if "QoS_Delay_Probabilities" in source.index else np.asarray([], dtype=float)
+        pred_targets = {name: float(predicted[f"Predicted_{name}"]) for name in names if f"Predicted_{name}" in predicted.index}
+        pred_report = approx_paper_objective_from_raw_prediction(
+            pred_targets, names, int(source.get("workload_mix_size", len(qos_probs) if len(qos_probs) else 0)),
+            ctrack_psi=args.report_ctrack_psi,
+            ctrack_mu=args.report_ctrack_mu,
+            ctrack_gamma=args.report_ctrack_gamma,
+            qos_beta=args.report_qos_beta,
+            qos_rho=args.report_qos_rho,
+            qos_threshold=args.report_qos_threshold,
+        )
+        actual_report = paper_form_objective_from_raw(
+            float(source["Simulator_RSR_Total_Cost"]),
+            float(source["Ctrack_Epsilon_90th"]),
+            qos_probs,
+            ctrack_psi=args.report_ctrack_psi,
+            ctrack_mu=args.report_ctrack_mu,
+            ctrack_gamma=args.report_ctrack_gamma,
+            qos_beta=args.report_qos_beta,
+            qos_rho=args.report_qos_rho,
+            qos_threshold=args.report_qos_threshold,
+        ) if len(qos_probs) else {}
+
         row = {
             "Configuration": label,
+            "FlexDC_Output_Dir": str(folder_path),
+            "FlexDC_Results_CSV": str(result_path),
+            "FlexDC_Diagnostics_CSV": str(diag_path),
             "Pbar_kw_per_server": float(source["Pbar_kw_per_server"]),
             "R_kw_per_server": float(source["R_kw_per_server"]),
+            "Pbar_plus_R": float(source["Pbar_kw_per_server"]) + float(source["R_kw_per_server"]),
+            "Pbar_minus_R": float(source["Pbar_kw_per_server"]) - float(source["R_kw_per_server"]),
             "Weights": json.dumps([float(source[col]) for col in weight_cols]),
             "Predicted_Optimization_Objective": float(predicted["Predicted_Optimization_Objective"]),
             "Actual_Optimization_Objective": float(np.dot(weights, actual)),
             "Predicted_Target_Sum": float(predicted["Predicted_Target_Sum"]),
             "Actual_Target_Sum": float(np.sum(actual)),
+            "QoS_Delay_Probabilities": json.dumps([float(x) for x in qos_probs]) if len(qos_probs) else "",
+            "Max_QoS_Delay_Probability": float(np.max(qos_probs)) if len(qos_probs) else np.nan,
+            "Mean_QoS_Delay_Probability": float(np.mean(qos_probs)) if len(qos_probs) else np.nan,
+            "Tracking_Pass": bool(float(source["Ctrack_Epsilon_90th"]) <= args.report_ctrack_gamma) if "Ctrack_Epsilon_90th" in source.index else False,
+            "QoS_Pass_CurrentLogic": bool(float(source["QoS_Violation_Ratio"]) <= args.report_qos_threshold) if "QoS_Violation_Ratio" in source.index else False,
+            **pred_report,
+            **actual_report,
         }
+        row["Both_Pass_CurrentLogic"] = bool(row["Tracking_Pass"] and row["QoS_Pass_CurrentLogic"])
         for idx, name in enumerate(names):
             row[f"Predicted_{name}"] = float(predicted[f"Predicted_{name}"])
             row[f"Actual_{name}"] = float(actual[idx])
-
-        row = add_component_audit_columns(
-            row=row,
-            source=source,
-            actual=actual,
-            predicted=predicted,
-            names=names,
-            objective_weights=weights,
-            target_family=target_family,
-            use_norm_cost=use_norm_cost,
-        )
-
         for col in [
             "Simulator_RSR_Total_Cost",
             "Simulator_Power_Cost",
@@ -471,21 +446,10 @@ def make_validation_table(
             "Diagnostic_FlexDC_SoftPlus_QoS_Cost",
             "Diagnostic_FullPaperObjective_Cost",
             "Mtrack_Error_MeanAbs_Normalized",
-            "Mtrack_Error_MeanAbs_Watts",
             "QoS_Delay_Probability_Sum",
             "QoS_Violation_Ratio",
         ]:
             row[col] = float(source[col]) if col in source.index and not pd.isna(source[col]) else np.nan
-
-        if "QoS_Delay_Probabilities" in source.index and not pd.isna(source["QoS_Delay_Probabilities"]):
-            probs = parse_probability_vector(source["QoS_Delay_Probabilities"])
-            row["QoS_Delay_Probabilities"] = json.dumps([float(x) for x in probs])
-            row["Max_QoS_Delay_Probability"] = float(np.max(probs)) if len(probs) else np.nan
-            row["Mean_QoS_Delay_Probability"] = float(np.mean(probs)) if len(probs) else np.nan
-        else:
-            row["QoS_Delay_Probabilities"] = ""
-            row["Max_QoS_Delay_Probability"] = np.nan
-            row["Mean_QoS_Delay_Probability"] = np.nan
         rows.append(row)
 
     table = pd.DataFrame(rows)
@@ -506,7 +470,6 @@ def write_markdown_report(table: pd.DataFrame, out_path: Path, target_family: st
         "Actual_Objective_Change_Percent_vs_Start",
         "Ctrack_Epsilon_90th",
         "QoS_Violation_Ratio",
-        "Max_QoS_Delay_Probability",
         "Diagnostic_FullPaperObjective_Cost",
     ]
     available = [c for c in cols if c in table.columns]
@@ -579,14 +542,14 @@ def main() -> None:
             run.finish()
         return
 
-    start_results, start_diagnostics = run_wizard(
+    start_results, start_diagnostics, start_folder = run_wizard(
         args,
         "start",
         candidate["starting_pbar_kw_per_server"],
         candidate["starting_r_kw_per_server"],
         candidate["starting_weights"],
     )
-    opt_results, opt_diagnostics = run_wizard(
+    opt_results, opt_diagnostics, opt_folder = run_wizard(
         args,
         "selected",
         candidate["optimized_pbar_kw_per_server"],
@@ -598,19 +561,27 @@ def main() -> None:
         prediction_table,
         start_results,
         start_diagnostics,
+        start_folder,
         opt_results,
         opt_diagnostics,
+        opt_folder,
         args.target_family,
         args.target_mode,
         use_norm_cost,
         args.raw_qos_aggregation,
+        args,
     )
     table.to_csv(out_dir / "end_to_end_validation_summary.csv", index=False)
-
-    component_table = build_component_comparison_table(table, args.target_family, args.target_mode)
-    component_table.to_csv(out_dir / "end_to_end_component_comparison.csv", index=False)
-    component_table.to_markdown(out_dir / "end_to_end_component_comparison.md", index=False)
-
+    key_cols = [c for c in [
+        "Configuration", "Pbar_kw_per_server", "R_kw_per_server", "Pbar_plus_R", "Pbar_minus_R", "Weights",
+        "Predicted_flexdc_M_RSR", "Actual_flexdc_M_RSR",
+        "Predicted_raw_Ctrack_Epsilon_90th", "Actual_raw_Ctrack_Epsilon_90th",
+        "Predicted_raw_qos_probability_mean", "Actual_raw_qos_probability_mean",
+        "QoS_Violation_Ratio", "Max_QoS_Delay_Probability", "Mean_QoS_Delay_Probability", "Tracking_Pass", "QoS_Pass_CurrentLogic", "Both_Pass_CurrentLogic",
+        "Predicted_PaperObjective_Approx", "paper_objective_from_raw",
+        "FlexDC_Output_Dir",
+    ] if c in table.columns]
+    table[key_cols].to_csv(out_dir / "end_to_end_raw_key_summary.csv", index=False)
     write_markdown_report(table, out_dir / "end_to_end_validation_report.md", args.target_family, args.target_mode, objective_weights)
 
     print("\nEnd-to-end validation summary")
@@ -620,18 +591,23 @@ def main() -> None:
         "R_kw_per_server",
         "Predicted_Optimization_Objective",
         "Actual_Optimization_Objective",
-        "Actual_Objective_Change_Percent_vs_Start",
-        "Ctrack_Epsilon_90th",
+        "Predicted_flexdc_M_RSR",
+        "Actual_flexdc_M_RSR",
+        "Predicted_raw_Ctrack_Epsilon_90th",
+        "Actual_raw_Ctrack_Epsilon_90th",
+        "Predicted_raw_qos_probability_mean",
+        "Actual_raw_qos_probability_mean",
         "QoS_Violation_Ratio",
         "Max_QoS_Delay_Probability",
-        "Diagnostic_FullPaperObjective_Cost",
+        "Mean_QoS_Delay_Probability",
+        "Both_Pass_CurrentLogic",
+        "paper_objective_from_raw",
     ]
     display_cols = [col for col in display_cols if col in table.columns]
     print(table[display_cols].round(6).to_string(index=False))
     print(f"\nSaved: {out_dir / 'end_to_end_validation_summary.csv'}")
-    print(f"Saved: {out_dir / 'end_to_end_component_comparison.csv'}")
-    print(f"Saved: {out_dir / 'end_to_end_component_comparison.md'}")
     print(f"Saved: {out_dir / 'end_to_end_validation_report.md'}")
+    print(f"Saved: {out_dir / 'end_to_end_raw_key_summary.csv'}")
 
     if run is not None:
         for _, row in table.iterrows():
