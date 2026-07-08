@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.nn import Softmax
 
 from data_center_model import DataCenterModel
@@ -135,6 +136,79 @@ def physical_to_model_feature(kw_per_server: float, denominator_watts: float, se
     return float(kw_per_server)
 
 
+def resolve_raw_objective_mode(target_family: str, target_mode: str, raw_objective_mode: str) -> str:
+    """Resolve optimizer objective mode.
+
+    weighted_sum is the original CONDOR-style behavior.
+    paper_approx is only for flexdc/raw models: it converts predicted raw
+    M_RSR, epsilon_90, and aggregate QoS probability into the FlexDC paper-form
+    objective approximation. Since the current raw model predicts an aggregate
+    QoS mean/sum instead of a per-job-type vector, the QoS term is approximate.
+    """
+    mode = str(raw_objective_mode).lower().strip()
+    if mode == "auto":
+        if target_family.lower().strip() == "flexdc" and target_mode.lower().strip() == "raw":
+            return "paper_approx"
+        return "weighted_sum"
+    if mode not in {"weighted_sum", "paper_approx"}:
+        raise ValueError(f"Unknown raw objective mode: {raw_objective_mode}")
+    if mode == "paper_approx" and not (target_family.lower().strip() == "flexdc" and target_mode.lower().strip() == "raw"):
+        raise ValueError("--raw-objective-mode paper_approx is only valid for flexdc/raw models.")
+    return mode
+
+
+def raw_paper_approx_objective(
+    pred_targets: torch.Tensor,
+    names: list[str],
+    raw_qos_aggregation: str,
+    job_count: int,
+    *,
+    ctrack_psi: float,
+    ctrack_mu: float,
+    ctrack_gamma: float,
+    qos_beta: float,
+    qos_rho: float,
+    qos_threshold: float,
+) -> tuple[torch.Tensor, dict]:
+    """Differentiable paper-form objective approximation for flexdc/raw.
+
+    Exact raw model outputs currently are:
+      flexdc_M_RSR, raw_Ctrack_Epsilon_90th, raw_qos_probability_mean
+    or, less commonly, raw_qos_probability_sum.
+
+    The exact paper QoS term uses the per-job-type probability vector. The
+    current model has only a mean/sum, so this approximates every job type as
+    having that predicted mean probability. This is much more faithful than an
+    unweighted raw sum and avoids the pathological M_RSR-only boundary collapse.
+    """
+    name_to_idx = {name: i for i, name in enumerate(names)}
+    required = ["flexdc_M_RSR", "raw_Ctrack_Epsilon_90th"]
+    missing = [name for name in required if name not in name_to_idx]
+    if missing:
+        raise ValueError(f"paper_approx objective missing required raw targets: {missing}; names={names}")
+
+    m_rsr = pred_targets[name_to_idx["flexdc_M_RSR"]]
+    eps90 = pred_targets[name_to_idx["raw_Ctrack_Epsilon_90th"]]
+
+    if "raw_qos_probability_mean" in name_to_idx:
+        qos_mean = pred_targets[name_to_idx["raw_qos_probability_mean"]]
+    elif "raw_qos_probability_sum" in name_to_idx:
+        qos_mean = pred_targets[name_to_idx["raw_qos_probability_sum"]] / float(job_count)
+    else:
+        raise ValueError(f"paper_approx objective requires raw_qos_probability_mean or raw_qos_probability_sum; names={names}")
+
+    ctrack = float(ctrack_psi) * F.softplus(float(ctrack_mu) * (eps90 - float(ctrack_gamma)))
+    cqos = float(qos_beta) * float(job_count) * F.softplus(float(qos_rho) * (qos_mean - float(qos_threshold)))
+    objective = m_rsr + ctrack + cqos
+    pieces = {
+        "Predicted_Objective_M_RSR_Term": m_rsr,
+        "Predicted_Objective_Ctrack_Approx_Term": ctrack,
+        "Predicted_Objective_CQoS_Approx_Term": cqos,
+        "Predicted_Objective_QoS_Mean_Used": qos_mean,
+    }
+    return objective, pieces
+
+
 def optimize_inputs(
     model_file,
     workload_config,
@@ -149,6 +223,13 @@ def optimize_inputs(
     use_norm_cost=None,
     use_norm_pr=True,
     objective_weights=None,
+    raw_objective_mode="auto",
+    objective_ctrack_psi=1.0,
+    objective_ctrack_mu=10.0,
+    objective_ctrack_gamma=0.3,
+    objective_qos_beta=20.0,
+    objective_qos_rho=2.0,
+    objective_qos_threshold=0.1,
     iterations=150,
     lr=1e-2,
     device_name="auto",
@@ -169,6 +250,7 @@ def optimize_inputs(
     if objective_weights is None:
         objective_weights = default_objective_weights(target_family)
     names = target_names(target_family, target_mode, raw_qos_aggregation)
+    resolved_raw_objective_mode = resolve_raw_objective_mode(target_family, target_mode, raw_objective_mode)
 
     device = choose_device(device_name)
     initial = build_model_inputs(
@@ -231,7 +313,22 @@ def optimize_inputs(
             torch.tensor(float(job_count), dtype=torch.float32, device=device),
         ])
         pred_targets = model(sim_features, workload).reshape(-1)
-        objective = sum(float(objective_weights[i]) * pred_targets[i] for i in range(3))
+        objective_pieces = {}
+        if resolved_raw_objective_mode == "paper_approx":
+            objective, objective_pieces = raw_paper_approx_objective(
+                pred_targets,
+                names,
+                raw_qos_aggregation,
+                job_count,
+                ctrack_psi=objective_ctrack_psi,
+                ctrack_mu=objective_ctrack_mu,
+                ctrack_gamma=objective_ctrack_gamma,
+                qos_beta=objective_qos_beta,
+                qos_rho=objective_qos_rho,
+                qos_threshold=objective_qos_threshold,
+            )
+        else:
+            objective = sum(float(objective_weights[i]) * pred_targets[i] for i in range(len(names)))
 
         pbar = model_feature_to_physical(
             float(p_feature.detach().cpu()), initial["Pbar_denominator_watts"], server_count, use_norm_pr
@@ -261,7 +358,10 @@ def optimize_inputs(
             **{f"Weight_{i}": float(weights[i].detach().cpu()) for i in range(job_count)},
             "Predicted_Optimization_Objective": float(objective.detach().cpu()),
             "Predicted_Target_Sum": float(np.sum(pred_np)),
+            "Raw_Objective_Mode": resolved_raw_objective_mode,
         }
+        for piece_name, piece_value in objective_pieces.items():
+            row[piece_name] = float(piece_value.detach().cpu())
         for idx, name in enumerate(names):
             row[f"Predicted_{name}"] = float(pred_np[idx])
             row[f"Predicted_unscaled_{name}"] = float(unscaled_np[idx])
@@ -338,6 +438,15 @@ def optimize_inputs(
         "optimized_weights": candidate_weights,
         "best_iteration": int(best["Iteration"]),
         "objective_weights": [float(x) for x in objective_weights],
+        "raw_objective_mode": resolved_raw_objective_mode,
+        "raw_objective_constants": {
+            "ctrack_psi": float(objective_ctrack_psi),
+            "ctrack_mu": float(objective_ctrack_mu),
+            "ctrack_gamma": float(objective_ctrack_gamma),
+            "qos_beta": float(objective_qos_beta),
+            "qos_rho": float(objective_qos_rho),
+            "qos_threshold": float(objective_qos_threshold),
+        },
         "predicted_optimization_objective": float(best["Predicted_Optimization_Objective"]),
         "prediction_at_candidate": candidate_prediction,
         "pr_bounds": pr_bounds,
@@ -379,6 +488,14 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=150)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--objective-weights", default="auto")
+    parser.add_argument("--raw-objective-mode", choices=["auto", "weighted_sum", "paper_approx"], default="auto",
+                        help="For flexdc/raw, auto uses paper_approx. weighted_sum reproduces the original weighted-sum behavior.")
+    parser.add_argument("--objective-ctrack-psi", type=float, default=1.0)
+    parser.add_argument("--objective-ctrack-mu", type=float, default=10.0)
+    parser.add_argument("--objective-ctrack-gamma", type=float, default=0.3)
+    parser.add_argument("--objective-qos-beta", type=float, default=20.0)
+    parser.add_argument("--objective-qos-rho", type=float, default=2.0)
+    parser.add_argument("--objective-qos-threshold", type=float, default=0.1)
     parser.add_argument("--pbar-lower-factor", type=float, default=0.9)
     parser.add_argument("--pbar-upper-factor", type=float, default=1.0)
     parser.add_argument("--pr-upper-factor", type=float, default=1.2)
@@ -419,6 +536,13 @@ def main():
         use_norm_cost=use_norm_cost,
         use_norm_pr=bool(use_norm_pr),
         objective_weights=objective_weights,
+        raw_objective_mode=args.raw_objective_mode,
+        objective_ctrack_psi=args.objective_ctrack_psi,
+        objective_ctrack_mu=args.objective_ctrack_mu,
+        objective_ctrack_gamma=args.objective_ctrack_gamma,
+        objective_qos_beta=args.objective_qos_beta,
+        objective_qos_rho=args.objective_qos_rho,
+        objective_qos_threshold=args.objective_qos_threshold,
         iterations=args.iterations,
         lr=args.lr,
         device_name=args.device,

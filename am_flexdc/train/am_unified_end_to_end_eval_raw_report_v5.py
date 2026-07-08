@@ -22,7 +22,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from am_unified_optimize_one_v2 import optimize_inputs
+from am_unified_optimize_one_v5 import optimize_inputs, resolve_raw_objective_mode
 from am_unified_predict_one import (
     default_objective_weights,
     parse_bool_text,
@@ -54,7 +54,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--utilization", type=float, default=None)
     parser.add_argument("--iterations", type=int, default=150)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--objective-weights", default="auto")
+    parser.add_argument("--objective-weights", default="auto", help="Linear objective weights. For flexdc/raw, used only with --raw-objective-mode=weighted_sum.")
+    parser.add_argument("--raw-objective-mode", choices=["auto", "weighted_sum", "paper_approx"], default="auto",
+                        help="For flexdc/raw, auto uses paper_approx. weighted_sum reproduces the old linear raw weighted-sum behavior.")
+    parser.add_argument("--objective-ctrack-psi", type=float, default=1.0)
+    parser.add_argument("--objective-ctrack-mu", type=float, default=10.0)
+    parser.add_argument("--objective-ctrack-gamma", type=float, default=0.3)
+    parser.add_argument("--objective-qos-beta", type=float, default=20.0)
+    parser.add_argument("--objective-qos-rho", type=float, default=2.0)
+    parser.add_argument("--objective-qos-threshold", type=float, default=0.1)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--out-dir", default="unified_end_to_end_eval")
 
@@ -411,6 +419,12 @@ def make_validation_table(
             qos_threshold=args.report_qos_threshold,
         ) if len(qos_probs) else {}
 
+        resolved_raw_objective_mode = resolve_raw_objective_mode(target_family, target_mode, getattr(args, "raw_objective_mode", "auto"))
+        if target_family == "flexdc" and target_mode == "raw" and resolved_raw_objective_mode == "paper_approx" and actual_report:
+            actual_optimization_objective = float(actual_report["paper_objective_from_raw"])
+        else:
+            actual_optimization_objective = float(np.dot(weights, actual))
+
         row = {
             "Configuration": label,
             "FlexDC_Output_Dir": str(folder_path),
@@ -422,7 +436,8 @@ def make_validation_table(
             "Pbar_minus_R": float(source["Pbar_kw_per_server"]) - float(source["R_kw_per_server"]),
             "Weights": json.dumps([float(source[col]) for col in weight_cols]),
             "Predicted_Optimization_Objective": float(predicted["Predicted_Optimization_Objective"]),
-            "Actual_Optimization_Objective": float(np.dot(weights, actual)),
+            "Actual_Optimization_Objective": actual_optimization_objective,
+            "Actual_Optimization_Objective_Type": resolved_raw_objective_mode if (target_family == "flexdc" and target_mode == "raw") else "weighted_sum",
             "Predicted_Target_Sum": float(predicted["Predicted_Target_Sum"]),
             "Actual_Target_Sum": float(np.sum(actual)),
             "QoS_Delay_Probabilities": json.dumps([float(x) for x in qos_probs]) if len(qos_probs) else "",
@@ -509,6 +524,13 @@ def main() -> None:
         use_norm_cost=use_norm_cost,
         use_norm_pr=bool(use_norm_pr),
         objective_weights=objective_weights,
+        raw_objective_mode=args.raw_objective_mode,
+        paper_ctrack_psi=args.paper_ctrack_psi,
+        paper_ctrack_mu=args.paper_ctrack_mu,
+        paper_ctrack_gamma=args.paper_ctrack_gamma,
+        paper_qos_beta=args.paper_qos_beta,
+        paper_qos_rho=args.paper_qos_rho,
+        paper_qos_threshold=args.paper_qos_threshold,
         iterations=args.iterations,
         lr=args.lr,
         device_name=args.device,
@@ -578,6 +600,7 @@ def main() -> None:
         "Predicted_raw_Ctrack_Epsilon_90th", "Actual_raw_Ctrack_Epsilon_90th",
         "Predicted_raw_qos_probability_mean", "Actual_raw_qos_probability_mean",
         "QoS_Violation_Ratio", "Max_QoS_Delay_Probability", "Mean_QoS_Delay_Probability", "Tracking_Pass", "QoS_Pass_CurrentLogic", "Both_Pass_CurrentLogic",
+        "Predicted_Objective_M_RSR_Component", "Predicted_Objective_Ctrack_Component", "Predicted_Objective_CQoS_Component",
         "Predicted_PaperObjective_Approx", "paper_objective_from_raw",
         "FlexDC_Output_Dir",
     ] if c in table.columns]
@@ -601,6 +624,9 @@ def main() -> None:
         "Max_QoS_Delay_Probability",
         "Mean_QoS_Delay_Probability",
         "Both_Pass_CurrentLogic",
+        "Predicted_Objective_M_RSR_Component",
+        "Predicted_Objective_Ctrack_Component",
+        "Predicted_Objective_CQoS_Component",
         "paper_objective_from_raw",
     ]
     display_cols = [col for col in display_cols if col in table.columns]
