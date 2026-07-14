@@ -15,3 +15,7 @@ am_flexdc/data/pilots/traditionaliso_newqos_pilot/*.csv
 am_flexdc/data/pilots/traditionaliso_newqos_pilot_flexdc_configured_objective/*.csv
 am_flexdc/data/pilots/traditionaliso_newqos_pilot_flexdc_configured_objective/
 am_flexdc/data/pilots/**/*.csv
+
+# Allow this specific pilot folder to be tracked
+!am_flexdc/data/pilots/flexdc_sweep_v2_paper_objective/
+!am_flexdc/data/pilots/flexdc_sweep_v2_paper_objective/**
