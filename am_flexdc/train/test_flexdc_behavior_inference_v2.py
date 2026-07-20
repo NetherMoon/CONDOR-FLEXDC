@@ -19,9 +19,11 @@ from am_flexdc_behavior_inference_utilities_v2 import (
     build_differentiable_features,
     build_flexdc_wizard_command,
     calculate_pr_bounds,
+    calculate_weight_bounds,
     load_behavior_model,
     make_feature_row,
     optimize_candidates,
+    parameterize_weights,
     predict_configuration,
     read_experiment_config,
     read_workload_config,
@@ -61,6 +63,7 @@ def main() -> None:
     safety = resolve_safety_limits(loaded.constants, tracking_margin=0.04, qos_margin=0.01)
     assert loaded.model.config.dim_job_mix == 13
     assert loaded.model.config.dim_dc_features == 12
+    assert not any(parameter.requires_grad for parameter in loaded.model.parameters())
     assert safety.selection_tracking_limit == 0.26
     assert abs(safety.selection_qos_limit - 0.09) < 1e-12
     print("PASS")
@@ -103,9 +106,19 @@ def main() -> None:
         workload=workload,
         experiment=experiment,
     )
-    p_t = torch.tensor([pbar], dtype=torch.float32, requires_grad=True)
-    r_t = torch.tensor([reserve], dtype=torch.float32, requires_grad=True)
-    w_t = torch.tensor(weights[None, :], dtype=torch.float32, requires_grad=True)
+    # The checkpoint may be loaded on CUDA when --device auto is used.
+    # Create the differentiable inputs on the same device as the model; otherwise
+    # PyTorch raises a CPU/CUDA matrix-multiplication device mismatch.
+    device = loaded.device
+    p_t = torch.tensor(
+        [pbar], dtype=torch.float32, device=device, requires_grad=True
+    )
+    r_t = torch.tensor(
+        [reserve], dtype=torch.float32, device=device, requires_grad=True
+    )
+    w_t = torch.tensor(
+        weights[None, :], dtype=torch.float32, device=device, requires_grad=True
+    )
     global_t, tokens_t, mask_t = build_differentiable_features(
         pbar=p_t,
         reserve=r_t,
@@ -114,15 +127,24 @@ def main() -> None:
         experiment=experiment,
         metadata=loaded.metadata,
     )
-    token_expected = (tokens - np.asarray(loaded.metadata.token_feature_mean)) / np.asarray(loaded.metadata.token_feature_std)
-    global_expected = (global_features - np.asarray(loaded.metadata.global_feature_mean)) / np.asarray(loaded.metadata.global_feature_std)
-    assert_close(tokens_t.detach().numpy()[0], token_expected, 2e-5)
-    assert_close(global_t.detach().numpy()[0], global_expected, 2e-5)
-    assert mask_t.all()
+    token_expected = (
+        tokens - np.asarray(loaded.metadata.token_feature_mean)
+    ) / np.asarray(loaded.metadata.token_feature_std)
+    global_expected = (
+        global_features - np.asarray(loaded.metadata.global_feature_mean)
+    ) / np.asarray(loaded.metadata.global_feature_std)
+    assert_close(tokens_t.detach().cpu().numpy()[0], token_expected, 2e-5)
+    assert_close(global_t.detach().cpu().numpy()[0], global_expected, 2e-5)
+    assert bool(mask_t.all().item())
     output = loaded.model(global_t, tokens_t, mask_t)
-    objective = output["tracking_logs"].sum() + output["qos_probabilities"].sum()
+    objective = (
+        output["tracking_logs"].sum()
+        + output["qos_probabilities"].sum()
+    )
     objective.backward()
-    assert torch.isfinite(p_t.grad).all() and torch.isfinite(r_t.grad).all() and torch.isfinite(w_t.grad).all()
+    assert p_t.grad is not None and torch.isfinite(p_t.grad).all()
+    assert r_t.grad is not None and torch.isfinite(r_t.grad).all()
+    assert w_t.grad is not None and torch.isfinite(w_t.grad).all()
     print("PASS")
 
     print("T3: Analytical cost lineage against a real training row")
@@ -154,6 +176,24 @@ def main() -> None:
         print("SKIP: --results-csv not supplied")
 
     print("T4: Optimization parameterization/top-k contract")
+    automatic_weight_bounds = calculate_weight_bounds(workload.job_count, experiment.server_count)
+    weight_logits_test = torch.randn(8, workload.job_count, device=loaded.device, requires_grad=True)
+    bounded_weights_test = parameterize_weights(
+        weight_logits_test,
+        automatic_weight_bounds.final_lower,
+        automatic_weight_bounds.final_upper,
+    )
+    assert torch.allclose(
+        bounded_weights_test.sum(dim=1),
+        torch.ones(8, device=loaded.device),
+        atol=2e-6,
+        rtol=0,
+    )
+    assert float(bounded_weights_test.min().detach().cpu()) >= automatic_weight_bounds.final_lower - 2e-6
+    assert float(bounded_weights_test.max().detach().cpu()) <= automatic_weight_bounds.final_upper + 2e-6
+    bounded_weights_test.square().sum().backward()
+    assert weight_logits_test.grad is not None and torch.isfinite(weight_logits_test.grad).all()
+
     if args.run_optimizer_smoke:
         settings = OptimizationSettings(
             starts=2,
@@ -181,7 +221,10 @@ def main() -> None:
         assert np.all(candidates["R_kw_per_server"] <= candidates["Pbar_kw_per_server"] + 1e-7)
         assert np.all(candidates["Pbar_plus_R"] <= bounds.pr_upper_kw_per_server + 1e-6)
         for value in candidates["weights"]:
-            assert_close(sum(value), 1.0, 1e-6)
+            assert_close(sum(value), 1.0, 2e-6)
+            assert min(value) >= automatic_weight_bounds.final_lower - 2e-6
+            assert max(value) <= automatic_weight_bounds.final_upper + 2e-6
+        assert candidates["Weight_Bounds_Pass"].all()
         if len(top_k) > 1:
             assert top_k["Candidate_Rank"].tolist() == list(range(1, len(top_k) + 1))
         print("PASS")

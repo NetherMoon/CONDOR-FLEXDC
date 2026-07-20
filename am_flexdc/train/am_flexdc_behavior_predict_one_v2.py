@@ -9,12 +9,14 @@ from pathlib import Path
 
 from am_flexdc_behavior_inference_utilities_v2 import (
     calculate_pr_bounds,
+    calculate_weight_bounds,
     dataframe_for_csv,
     load_behavior_model,
     predict_configuration,
     read_experiment_config,
     read_workload_config,
     resolve_safety_limits,
+    validate_weight_bounds,
     write_json,
 )
 
@@ -71,17 +73,24 @@ def main() -> None:
         tracking_margin=args.tracking_margin,
         qos_margin=args.qos_margin,
     )
+    weight_values = parse_weights(args.weights)
+    weight_bounds = calculate_weight_bounds(workload.job_count, experiment.server_count)
+    validate_weight_bounds(weight_values, weight_bounds)
+
     result, per_job = predict_configuration(
         loaded,
         workload=workload,
         experiment=experiment,
         pbar_kw_per_server=args.pbar,
         r_kw_per_server=args.r,
-        weights=parse_weights(args.weights),
+        weights=weight_values,
         safety=safety,
         bounds=bounds,
         r_over_p_max=args.r_over_p_max,
     )
+
+    result["Weight_Bounds"] = weight_bounds.to_dict()
+    result["Weight_Bounds_Pass"] = True
 
     print("\nPrediction summary")
     display_fields = [

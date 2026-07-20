@@ -54,6 +54,8 @@ from data_center_model_flexdc_behavior_v2 import (
 
 KWH_IN_WATT_SECONDS = 3600.0 * 1000.0
 DEFAULT_ENERGY_PRICE_PER_KWH = 0.1
+DEFAULT_WEIGHT_MIN_FRACTION_OF_EQUAL = 0.1
+DEFAULT_WEIGHT_MAX_MULTIPLE_OF_EQUAL = 4.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,20 @@ class PRBounds:
     pbar_upper_kw_per_server: float
     pr_upper_kw_per_server: float
     r_lower_kw_per_server: float
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WeightBounds:
+    equal_weight: float
+    relative_lower: float
+    relative_upper: float
+    server_lower: float
+    upper_from_lower: float
+    final_lower: float
+    final_upper: float
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -147,6 +163,11 @@ class OptimizationSettings:
     random_seed: int = 0
     near_equal_start_fraction: float = 0.25
     high_p_low_r_start_fraction: float = 0.25
+    enforce_flexdc_weight_bounds: bool = True
+    weight_min_fraction_of_equal: float = DEFAULT_WEIGHT_MIN_FRACTION_OF_EQUAL
+    weight_max_multiple_of_equal: float = DEFAULT_WEIGHT_MAX_MULTIPLE_OF_EQUAL
+    # Optional stricter experiment-level overrides.  These are intersected
+    # with the automatic FlexDC bounds rather than replacing them.
     weight_min: float | None = None
     weight_max: float | None = None
     r_over_p_max: float | None = None
@@ -171,6 +192,10 @@ class OptimizationSettings:
             raise ValueError("near_equal_start_fraction must be in [0,1]")
         if not 0 <= self.high_p_low_r_start_fraction <= 1:
             raise ValueError("high_p_low_r_start_fraction must be in [0,1]")
+        if self.weight_min_fraction_of_equal < 0:
+            raise ValueError("weight_min_fraction_of_equal must be nonnegative")
+        if self.weight_max_multiple_of_equal <= 0:
+            raise ValueError("weight_max_multiple_of_equal must be positive")
         if self.weight_min is not None:
             if self.weight_min < 0 or self.weight_min * job_count >= 1.0:
                 raise ValueError("weight_min must satisfy 0 <= J*weight_min < 1")
@@ -320,6 +345,113 @@ def validate_weights(weights: Sequence[float], job_count: int) -> np.ndarray:
     if not np.isclose(float(array.sum()), 1.0, atol=1e-6):
         raise ValueError(f"Weights must sum to one; got {array.sum()}")
     return array
+
+
+def calculate_weight_bounds(
+    job_count: int,
+    server_count: int,
+    *,
+    min_fraction_of_equal: float = DEFAULT_WEIGHT_MIN_FRACTION_OF_EQUAL,
+    max_multiple_of_equal: float = DEFAULT_WEIGHT_MAX_MULTIPLE_OF_EQUAL,
+) -> WeightBounds:
+    """Mirror FlexDC's finalized workload-weight bounds exactly.
+
+    FlexDC requires every job type to receive at least a fraction of equal
+    allocation and at least one server.  The upper bound is the stricter of
+    the configured multiple of equal weight and the amount remaining after
+    assigning the lower bound to the other J-1 job types.
+    """
+    job_count = int(job_count)
+    server_count = int(server_count)
+    if job_count <= 0:
+        raise ValueError("job_count must be positive")
+    if server_count < job_count:
+        raise ValueError(
+            f"Weight feasibility is impossible: server_count={server_count} < job_count={job_count}"
+        )
+    equal = 1.0 / job_count
+    relative_lower = float(min_fraction_of_equal) * equal
+    relative_upper = float(max_multiple_of_equal) * equal
+    server_lower = 1.0 / server_count
+    final_lower = max(relative_lower, server_lower)
+    upper_from_lower = 1.0 - (job_count - 1) * final_lower
+    final_upper = min(relative_upper, upper_from_lower)
+    if final_upper < final_lower or job_count * final_lower > 1.0 + 1e-12 or job_count * final_upper < 1.0 - 1e-12:
+        raise ValueError(
+            "Infeasible finalized weight bounds: "
+            f"J={job_count}, N={server_count}, lower={final_lower}, upper={final_upper}"
+        )
+    return WeightBounds(
+        equal_weight=equal,
+        relative_lower=relative_lower,
+        relative_upper=relative_upper,
+        server_lower=server_lower,
+        upper_from_lower=upper_from_lower,
+        final_lower=final_lower,
+        final_upper=final_upper,
+    )
+
+
+def resolve_effective_weight_bounds(
+    settings: OptimizationSettings,
+    *,
+    job_count: int,
+    server_count: int,
+) -> WeightBounds:
+    if settings.enforce_flexdc_weight_bounds:
+        base = calculate_weight_bounds(
+            job_count,
+            server_count,
+            min_fraction_of_equal=settings.weight_min_fraction_of_equal,
+            max_multiple_of_equal=settings.weight_max_multiple_of_equal,
+        )
+        lower = base.final_lower
+        upper = base.final_upper
+    else:
+        equal = 1.0 / job_count
+        base = WeightBounds(equal, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+        lower, upper = 0.0, 1.0
+    if settings.weight_min is not None:
+        lower = max(lower, float(settings.weight_min))
+    if settings.weight_max is not None:
+        upper = min(upper, float(settings.weight_max))
+    if job_count * lower >= 1.0 - 1e-12:
+        raise ValueError(f"Effective weight lower bound {lower} is infeasible for J={job_count}")
+    if job_count * upper < 1.0 - 1e-12:
+        raise ValueError(f"Effective weight upper bound {upper} is infeasible for J={job_count}")
+    if upper <= lower:
+        raise ValueError(f"Effective weight bounds are empty: lower={lower}, upper={upper}")
+    return WeightBounds(
+        equal_weight=base.equal_weight,
+        relative_lower=base.relative_lower,
+        relative_upper=base.relative_upper,
+        server_lower=base.server_lower,
+        upper_from_lower=base.upper_from_lower,
+        final_lower=lower,
+        final_upper=upper,
+    )
+
+
+def validate_weight_bounds(
+    weights: Sequence[float],
+    bounds: WeightBounds,
+    *,
+    tolerance: float = 1e-6,
+) -> np.ndarray:
+    values = np.asarray(weights, dtype=np.float64)
+    if not np.isfinite(values).all():
+        raise ValueError("Weights contain non-finite values")
+    if abs(float(values.sum()) - 1.0) > tolerance:
+        raise ValueError(f"Weights must sum to 1; sum={values.sum()}")
+    if float(values.min()) < bounds.final_lower - tolerance:
+        raise ValueError(
+            f"Weight vector violates FlexDC lower bound: min={values.min()}, lower={bounds.final_lower}, weights={values.tolist()}"
+        )
+    if float(values.max()) > bounds.final_upper + tolerance:
+        raise ValueError(
+            f"Weight vector violates FlexDC upper bound: max={values.max()}, upper={bounds.final_upper}, weights={values.tolist()}"
+        )
+    return values
 
 
 def validate_physical_bid(
@@ -744,12 +876,40 @@ def _logit(value: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return torch.log(value) - torch.log1p(-value)
 
 
-def parameterize_weights(logits: torch.Tensor, weight_min: float | None) -> torch.Tensor:
-    probs = torch.softmax(logits, dim=-1)
-    if weight_min is None or weight_min <= 0:
-        return probs
+def parameterize_weights(
+    logits: torch.Tensor,
+    weight_min: float | None,
+    weight_max: float | None = None,
+) -> torch.Tensor:
+    """Map unconstrained logits to a bounded simplex.
+
+    With only a lower bound, an affine Softmax gives an exact, efficient map.
+    With both lower and upper bounds, a differentiable scalar offset is solved
+    by Newton iterations so that every weight lies in [lower, upper] and the
+    row sums remain one.
+    """
+    lower = float(weight_min or 0.0)
+    upper = float(weight_max if weight_max is not None else 1.0)
     job_count = logits.shape[1]
-    return float(weight_min) + (1.0 - job_count * float(weight_min)) * probs
+    if lower < 0 or upper > 1 or upper <= lower:
+        raise ValueError(f"Invalid weight bounds: lower={lower}, upper={upper}")
+    if job_count * lower >= 1.0 or job_count * upper < 1.0:
+        raise ValueError(f"Weight bounds are infeasible for J={job_count}: lower={lower}, upper={upper}")
+    if upper >= 1.0 - (job_count - 1) * lower - 1e-12:
+        probs = torch.softmax(logits, dim=-1)
+        return lower + (1.0 - job_count * lower) * probs
+
+    # Solve sum_i lower + (upper-lower)*sigmoid(z_i + lambda) = 1.
+    work = logits.to(dtype=torch.float64)
+    lam = torch.zeros((logits.shape[0], 1), dtype=work.dtype, device=work.device)
+    scale = upper - lower
+    for _ in range(32):
+        sig = torch.sigmoid(work + lam)
+        residual = lower * job_count + scale * sig.sum(dim=1, keepdim=True) - 1.0
+        derivative = scale * (sig * (1.0 - sig)).sum(dim=1, keepdim=True).clamp_min(1e-12)
+        lam = lam - residual / derivative
+    weights = lower + scale * torch.sigmoid(work + lam)
+    return weights.to(dtype=logits.dtype)
 
 
 def parameterize_bid(
@@ -783,6 +943,7 @@ def _initial_logits(
     initial_pbar: float | None,
     initial_reserve: float | None,
     initial_weights: Sequence[float] | None,
+    weight_bounds: WeightBounds,
     device: torch.device,
 ) -> tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter]:
     generator = torch.Generator(device="cpu")
@@ -819,11 +980,17 @@ def _initial_logits(
             r_logits[0] = _logit(torch.tensor(r_fraction_value))
     if initial_weights is not None:
         weights = validate_weights(initial_weights, workload.job_count)
-        lower = float(settings.weight_min or 0.0)
-        base = (weights - lower) / max(1.0 - workload.job_count * lower, 1e-9)
-        base = np.clip(base, 1e-8, None)
-        base = base / base.sum()
-        weight_logits[0] = torch.log(torch.tensor(base, dtype=torch.float32))
+        validate_weight_bounds(weights, weight_bounds)
+        lower = weight_bounds.final_lower
+        upper = weight_bounds.final_upper
+        if upper >= 1.0 - (workload.job_count - 1) * lower - 1e-12:
+            base = (weights - lower) / max(1.0 - workload.job_count * lower, 1e-9)
+            base = np.clip(base, 1e-8, None)
+            base = base / base.sum()
+            weight_logits[0] = torch.log(torch.tensor(base, dtype=torch.float32))
+        else:
+            scaled = np.clip((weights - lower) / (upper - lower), 1e-6, 1.0 - 1e-6)
+            weight_logits[0] = torch.logit(torch.tensor(scaled, dtype=torch.float32))
     else:
         weight_logits[0] = 0.0  # equal-weight anchor
     return (
@@ -911,6 +1078,11 @@ def optimize_candidates(
     initial_weights: Sequence[float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     settings.validate(workload.job_count)
+    weight_bounds = resolve_effective_weight_bounds(
+        settings,
+        job_count=workload.job_count,
+        server_count=experiment.server_count,
+    )
     p_logits, r_logits, weight_logits = _initial_logits(
         settings=settings,
         bounds=bounds,
@@ -918,6 +1090,7 @@ def optimize_candidates(
         initial_pbar=initial_pbar,
         initial_reserve=initial_reserve,
         initial_weights=initial_weights,
+        weight_bounds=weight_bounds,
         device=loaded.device,
     )
     optimizer = torch.optim.Adam([p_logits, r_logits, weight_logits], lr=settings.learning_rate)
@@ -929,7 +1102,7 @@ def optimize_candidates(
             group["lr"] = lr
         optimizer.zero_grad(set_to_none=True)
         pbar, reserve, r_upper = parameterize_bid(p_logits, r_logits, bounds, settings)
-        weights = parameterize_weights(weight_logits, settings.weight_min)
+        weights = parameterize_weights(weight_logits, weight_bounds.final_lower, weight_bounds.final_upper)
         global_features, token_features, mask = build_differentiable_features(
             pbar=pbar,
             reserve=reserve,
@@ -966,10 +1139,7 @@ def optimize_candidates(
             settings.tracking_penalty * tracking_violation.square()
             + settings.qos_penalty * qos_violation.square().sum(dim=1)
         )
-        weight_penalty = torch.zeros_like(constraint_penalty)
-        if settings.weight_max is not None:
-            weight_penalty = settings.qos_penalty * F.relu(weights - settings.weight_max).square().sum(dim=1)
-        loss_per_start = reconstructed["objective"] + penalty_multiplier * (constraint_penalty + weight_penalty)
+        loss_per_start = reconstructed["objective"] + penalty_multiplier * constraint_penalty
         loss = loss_per_start.mean()
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Optimization loss became non-finite at step {step}")
@@ -1003,7 +1173,7 @@ def optimize_candidates(
 
     with torch.no_grad():
         pbar, reserve, r_upper = parameterize_bid(p_logits, r_logits, bounds, settings)
-        weights = parameterize_weights(weight_logits, settings.weight_min)
+        weights = parameterize_weights(weight_logits, weight_bounds.final_lower, weight_bounds.final_upper)
         global_features, token_features, mask = build_differentiable_features(
             pbar=pbar,
             reserve=reserve,
@@ -1031,7 +1201,11 @@ def optimize_candidates(
         exact_qos = max_pj <= loaded.constants.qos_threshold
         safety_tracking = float(reconstructed["p90_tracking"][index].detach().cpu()) <= safety.selection_tracking_limit
         safety_qos = max_pj <= safety.selection_qos_limit
-        weight_max_ok = settings.weight_max is None or float(np.max(weight_values)) <= settings.weight_max + 1e-8
+        weight_bounds_ok = bool(
+            float(np.min(weight_values)) >= weight_bounds.final_lower - 1e-6
+            and float(np.max(weight_values)) <= weight_bounds.final_upper + 1e-6
+            and abs(float(np.sum(weight_values)) - 1.0) <= 1e-5
+        )
         candidate_rows.append(
             {
                 "Start_Index": int(index),
@@ -1053,17 +1227,19 @@ def optimize_candidates(
                 "Predicted_Full_Objective": float(reconstructed["objective"][index].detach().cpu()),
                 "Exact_Tracking_Pass": bool(exact_tracking),
                 "Exact_QoS_Pass": bool(exact_qos),
-                "Exact_Both_Pass": bool(exact_tracking and exact_qos and weight_max_ok),
+                "Exact_Both_Pass": bool(exact_tracking and exact_qos and weight_bounds_ok),
                 "Safety_Tracking_Pass": bool(safety_tracking),
                 "Safety_QoS_Pass": bool(safety_qos),
-                "Safety_Both_Pass": bool(safety_tracking and safety_qos and weight_max_ok),
+                "Safety_Both_Pass": bool(safety_tracking and safety_qos and weight_bounds_ok),
                 "Exact_Tracking_Slack": float(loaded.constants.tracking_threshold - reconstructed["p90_tracking"][index].detach().cpu()),
                 "Exact_QoS_Slack": float(loaded.constants.qos_threshold - max_pj),
                 "Safety_Tracking_Slack": float(safety.selection_tracking_limit - reconstructed["p90_tracking"][index].detach().cpu()),
                 "Safety_QoS_Slack": float(safety.selection_qos_limit - max_pj),
                 "Weight_Min": float(np.min(weight_values)),
                 "Weight_Max": float(np.max(weight_values)),
-                "Weight_Max_Pass": bool(weight_max_ok),
+                "Weight_Bounds_Pass": bool(weight_bounds_ok),
+                "Effective_Weight_Min": float(weight_bounds.final_lower),
+                "Effective_Weight_Max": float(weight_bounds.final_upper),
             }
         )
     candidates = pd.DataFrame(candidate_rows).sort_values("Predicted_Full_Objective").reset_index(drop=True)
@@ -1339,6 +1515,18 @@ def run_flexdc_validation(
     timeout_seconds: int = 1800,
     dry_run: bool = False,
 ) -> tuple[dict, pd.DataFrame]:
+    workload_spec = read_workload_config(workload_config)
+    experiment_spec = read_experiment_config(
+        experiment_config,
+        utilization_override=float(utilization),
+    )
+    wizard_weight_bounds = calculate_weight_bounds(
+        workload_spec.job_count,
+        experiment_spec.server_count,
+    )
+    validate_weights(weights, workload_spec.job_count)
+    validate_weight_bounds(weights, wizard_weight_bounds)
+
     command, cwd, environment = build_flexdc_wizard_command(
         python_executable=python_executable,
         flexdc_root=flexdc_root,

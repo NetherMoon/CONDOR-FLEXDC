@@ -22,6 +22,7 @@ from am_flexdc_behavior_inference_utilities_v2 import (
     read_experiment_config,
     read_workload_config,
     resolve_safety_limits,
+    resolve_effective_weight_bounds,
     run_flexdc_validation,
     score_candidate_table_with_checkpoint,
     write_json,
@@ -84,8 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--r-min", type=float, default=None)
     parser.add_argument("--r-max", type=float, default=None)
     parser.add_argument("--r-over-p-max", type=float, default=None)
-    parser.add_argument("--weight-min", type=float, default=None)
-    parser.add_argument("--weight-max", type=float, default=None)
+    parser.add_argument(
+        "--enforce-flexdc-weight-bounds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enforce the same server/job-count weight bounds as the FlexDC wizard (default: true)",
+    )
+    parser.add_argument("--weight-min-fraction-of-equal", type=float, default=0.1)
+    parser.add_argument("--weight-max-multiple-of-equal", type=float, default=4.0)
+    parser.add_argument("--weight-min", type=float, default=None, help="Optional stricter absolute lower bound")
+    parser.add_argument("--weight-max", type=float, default=None, help="Optional stricter absolute upper bound")
 
     parser.add_argument("--flexdc-root", required=True)
     parser.add_argument("--gradient-config", required=True)
@@ -140,6 +149,9 @@ def main() -> None:
         random_seed=args.random_seed,
         near_equal_start_fraction=args.near_equal_start_fraction,
         high_p_low_r_start_fraction=args.high_p_low_r_start_fraction,
+        enforce_flexdc_weight_bounds=args.enforce_flexdc_weight_bounds,
+        weight_min_fraction_of_equal=args.weight_min_fraction_of_equal,
+        weight_max_multiple_of_equal=args.weight_max_multiple_of_equal,
         weight_min=args.weight_min,
         weight_max=args.weight_max,
         r_over_p_max=args.r_over_p_max,
@@ -148,6 +160,12 @@ def main() -> None:
         r_min_override=args.r_min,
         r_max_override=args.r_max,
         log_every=args.log_every,
+    )
+
+    effective_weight_bounds = resolve_effective_weight_bounds(
+        settings,
+        job_count=workload.job_count,
+        server_count=experiment.server_count,
     )
 
     candidates, top_k, trajectory = optimize_candidates(
@@ -251,6 +269,7 @@ def main() -> None:
             "message": "No top-k candidate met the configured selection thresholds. FlexDC validation was not run for an unconstrained fallback.",
             "safety": safety.to_dict(),
             "settings": settings.__dict__,
+        "effective_weight_bounds": effective_weight_bounds.to_dict(),
             "exact_feasible_starts": int(candidates["Exact_Both_Pass"].sum()),
             "safety_feasible_starts": int(candidates["Safety_Both_Pass"].sum()),
         }
@@ -300,6 +319,7 @@ def main() -> None:
         "experiment_config": str(Path(args.experiment_config).resolve()),
         "safety": safety.to_dict(),
         "settings": settings.__dict__,
+        "effective_weight_bounds": effective_weight_bounds.to_dict(),
         "exact_feasible_starts": int(candidates["Exact_Both_Pass"].sum()),
         "safety_feasible_starts": int(candidates["Safety_Both_Pass"].sum()),
         "top_k_count": int(len(top_k)),
