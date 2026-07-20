@@ -358,6 +358,12 @@ def load_behavior_model(
         config_class=FlexDCBehaviorModelConfig,
         device_name=device_name,
     )
+    # Inference optimizes Pbar, R, and weight inputs—not the trained network.
+    # Freeze model parameters to avoid storing/accumulating 3.9M parameter
+    # gradients during every candidate-optimization step. Gradients still flow
+    # through the frozen network into the differentiable inputs.
+    model.eval()
+    model.requires_grad_(False)
     metadata = BehaviorDataMetadata(**checkpoint["data_metadata"])
     constants = FlexDCBehaviorConstants(**metadata.constants)
     device = next(model.parameters()).device

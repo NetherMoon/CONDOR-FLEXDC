@@ -61,6 +61,7 @@ def main() -> None:
     safety = resolve_safety_limits(loaded.constants, tracking_margin=0.04, qos_margin=0.01)
     assert loaded.model.config.dim_job_mix == 13
     assert loaded.model.config.dim_dc_features == 12
+    assert not any(parameter.requires_grad for parameter in loaded.model.parameters())
     assert safety.selection_tracking_limit == 0.26
     assert abs(safety.selection_qos_limit - 0.09) < 1e-12
     print("PASS")
