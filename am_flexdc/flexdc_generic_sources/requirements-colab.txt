@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+tabulate
+wandb
+nbformat
+# PyTorch is intentionally not pinned or reinstalled in Colab.
+
+openpyxl
+tqdm

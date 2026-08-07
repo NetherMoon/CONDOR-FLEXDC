@@ -1,4 +1,4 @@
-"""Training utilities for CONDOR-based FlexDC Model V3.
+"""Training utilities for CONDOR-based the FlexDC behavior model.
 
 Key improvements over v1
 ------------------------
@@ -128,7 +128,7 @@ class BehaviorDataMetadata:
     removed_duplicate_rows: int
     sampler_config: dict
 
-    # New Sweep-V3 metadata. The legacy heldout fields above remain aliases
+    # New frozen-benchmark metadata. The legacy heldout fields above remain aliases
     # for validation so older checkpoints and inference code still load.
     validation_group_count: int = 0
     test_group_count: int = 0
@@ -236,11 +236,11 @@ def read_results_and_diagnostics(
     results_csv: str | Path,
     diagnostics_csv: str | Path | None,
 ) -> pd.DataFrame:
-    results = pd.read_csv(results_csv, low_memory=False)
+    results = pd.read_csv(results_csv)
     if diagnostics_csv is None or str(diagnostics_csv).strip() == "":
         return results
 
-    diagnostics = pd.read_csv(diagnostics_csv, low_memory=False)
+    diagnostics = pd.read_csv(diagnostics_csv)
     keys = None
     for candidate in MERGE_KEYS_PRIORITY:
         if all(key in results.columns and key in diagnostics.columns for key in candidate):
@@ -554,7 +554,7 @@ def stratified_context_group_split(
 ) -> tuple[set[str], set[str], dict]:
     """Backward-compatible two-way split for older datasets.
 
-    Sweep V3 should use the preassigned Data_Split column instead.
+    the frozen benchmark should use the preassigned Data_Split column instead.
     """
     rng = np.random.default_rng(split_seed)
     train_groups: set[str] = set()
@@ -592,7 +592,7 @@ def preassigned_train_validation_test_split(
     *,
     split_column: str = "Data_Split",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-    """Use the split frozen by the Sweep V3 plan generator.
+    """Use the split frozen by the the frozen benchmark plan generator.
 
     Every Base_Plan_Row_ID must belong to exactly one split, which keeps all
     seed realizations of the same operating configuration together.
@@ -698,7 +698,7 @@ def build_training_sampling_weights(
 ) -> tuple[np.ndarray | None, dict]:
     """Build row probabilities while treating seed repeats as one base input.
 
-    Sweep V3 repeats five percent of base configurations with extra seeds.
+    the frozen benchmark repeats five percent of base configurations with extra seeds.
     Without normalization, a three-seed configuration would receive three
     times the training probability of an otherwise identical one-seed
     configuration.  We first assign probability to Base_Plan_Row_ID groups
@@ -1009,7 +1009,7 @@ def prepare_behavior_data(
     qos_boundary_boost: float = 3.0,
     repeat_group_normalization: bool = True,
 ) -> BehaviorDataBundle:
-    """Prepare behavior-model data with Sweep-V3 split support.
+    """Prepare behavior-model data with frozen-benchmark split support.
 
     ``split_mode='auto'`` uses the preassigned train/validation/test split when
     ``Data_Split`` is present. Older datasets without that column retain the
@@ -1040,39 +1040,20 @@ def prepare_behavior_data(
     merged["_base_group_normalization_weight"] = computed_group_weight
 
     supplied_group_weight_error = 0.0
-    supplied_group_weight_nonfinite_rows = 0
-    supplied_group_weight_finite_rows = 0
     if "Base_Group_Normalization_Weight" in merged.columns:
-        supplied_series = pd.to_numeric(
+        supplied = pd.to_numeric(
             merged["Base_Group_Normalization_Weight"], errors="coerce"
+        ).to_numpy(float)
+        if not np.isfinite(supplied).all():
+            raise ValueError("Base_Group_Normalization_Weight contains non-finite values.")
+        supplied_group_weight_error = float(
+            np.max(np.abs(supplied - computed_group_weight.to_numpy(float)))
         )
-        supplied = supplied_series.to_numpy(dtype=float)
-        computed = computed_group_weight.to_numpy(dtype=float)
-        finite_mask = np.isfinite(supplied)
-
-        supplied_group_weight_finite_rows = int(finite_mask.sum())
-        supplied_group_weight_nonfinite_rows = int((~finite_mask).sum())
-
-        # Base_Group_Normalization_Weight is a redundant convenience column.
-        # The authoritative value is recomputed from Base_Plan_Row_ID group
-        # sizes above. Missing/non-numeric supplied values are therefore safe to
-        # repair, while any finite supplied value that disagrees remains a hard
-        # error because it indicates inconsistent grouping metadata.
-        if finite_mask.any():
-            supplied_group_weight_error = float(
-                np.max(np.abs(supplied[finite_mask] - computed[finite_mask]))
+        if supplied_group_weight_error > 1e-10:
+            raise ValueError(
+                "Base_Group_Normalization_Weight disagrees with Base_Plan_Row_ID "
+                f"group sizes; max error={supplied_group_weight_error}."
             )
-            if supplied_group_weight_error > 1e-10:
-                raise ValueError(
-                    "Base_Group_Normalization_Weight disagrees with "
-                    "Base_Plan_Row_ID group sizes; "
-                    f"max error={supplied_group_weight_error}."
-                )
-
-        if supplied_group_weight_nonfinite_rows:
-            repaired = supplied_series.copy()
-            repaired.loc[~finite_mask] = computed_group_weight.loc[~finite_mask]
-            merged["Base_Group_Normalization_Weight"] = repaired.astype(float)
 
     split_mode_normalized = str(split_mode).strip().lower()
     if split_mode_normalized not in {"auto", "preassigned", "generated", "legacy"}:
@@ -1115,7 +1096,7 @@ def prepare_behavior_data(
     if len(train_df) == 0 or len(validation_df) == 0:
         raise ValueError("Training and validation splits must both be non-empty.")
     if use_preassigned and len(test_df) == 0:
-        raise ValueError("Preassigned Sweep-V3 split must include a non-empty test set.")
+        raise ValueError("Preassigned frozen-benchmark split must include a non-empty test set.")
 
     # No validation or test information contributes to normalization.
     feature_stats = compute_feature_statistics(train_df)
@@ -1238,15 +1219,6 @@ def prepare_behavior_data(
             (merged.groupby("_group_id").size() > 1).sum()
         ),
         "base_group_normalization_max_input_error": supplied_group_weight_error,
-        "base_group_normalization_finite_input_rows": (
-            supplied_group_weight_finite_rows
-        ),
-        "base_group_normalization_repaired_nonfinite_rows": (
-            supplied_group_weight_nonfinite_rows
-        ),
-        "base_group_normalization_authority": (
-            "recomputed_from_Base_Plan_Row_ID_group_sizes"
-        ),
         "sampler": sampler_audit,
     }
 
@@ -1727,7 +1699,7 @@ def _checkpoint_payload(
 ) -> dict:
     return {
         "format_version": 3,
-        "model_version": "flexdc_behavior_v3",
+        "model_version": "flexdc_behavior_model",
         "epoch": int(epoch),
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -1756,7 +1728,7 @@ def save_training_checkpoint(path: str | Path, payload: dict) -> Path:
 def _load_training_checkpoint(path: str | Path, *, model, optimizer, device: torch.device) -> dict:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if int(checkpoint.get("format_version", 0)) != 3:
-        raise ValueError("Resume requires a Model V3 training checkpoint.")
+        raise ValueError("Resume requires a behavior-model training checkpoint.")
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
@@ -1781,7 +1753,7 @@ def train_behavior_model(
     tracking_boundary_multiplier: float = 2.0,
     qos_boundary_multiplier: float = 2.0,
     checkpoint_dir: str | Path = "checkpoints",
-    checkpoint_prefix: str = "flexdc_behavior_v3",
+    checkpoint_prefix: str = "flexdc_behavior_model",
     model_config: Mapping | None = None,
     training_config: Mapping | None = None,
     resume_from: str | Path | None = None,
@@ -1791,7 +1763,7 @@ def train_behavior_model(
     verbose: bool = True,
 ) -> tuple[object, TrainingResult]:
     if metrics_every_n_epochs != 1:
-        raise ValueError("Model V3 checkpoint/early-stopping logic requires metrics_every_n_epochs=1")
+        raise ValueError("behavior-model checkpoint/early-stopping logic requires metrics_every_n_epochs=1")
     device = choose_device(device_name)
     model.to(device)
     optimizer = torch.optim.AdamW(
@@ -2142,7 +2114,7 @@ def final_behavior_test_evaluation(
     """Evaluate the untouched test split once after model selection."""
     if data.test_loader is None or data.test_dataframe is None or len(data.test_dataframe) == 0:
         raise ValueError(
-            "No test split is available. Sweep V3 training requires a "
+            "No test split is available. the frozen benchmark training requires a "
             "preassigned Data_Split column with train/validation/test rows."
         )
     device = choose_device(device_name)
